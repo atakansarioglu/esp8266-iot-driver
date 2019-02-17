@@ -28,9 +28,9 @@
 
 // Includes.
 #include "ESP8266Client.h"
+#include "circularuart.h"
 #include <string.h>
 #include <assert.h>
-#include "circularuart.h"
 
 // Timing settings.
 #define ESP82_TIMEOUT_MS_CMD           2500UL///< Command sending and processing timeout.
@@ -38,7 +38,7 @@
 #define ESP82_TIMEOUT_MS_DATA_SEND    10000UL///< Data sending timeout.
 #define ESP82_TIMEOUT_MS_RESTART       2000UL///< Module restart timeout.
 #define ESP82_TIMEOUT_MS_AP_CONNECT   20000UL///< AP connecting timeout.
-#define ESP82_TIMEOUT_MS_HOST_CONNECT 20000UL///< Host connecting timeout.
+#define ESP82_TIMEOUT_MS_HOST_CONNECT 10000UL///< Host connecting timeout.
 
 // Buffer settings.
 #define ESP82_BUFFERSIZE_UART_2N 7UL///< Buffer size of 2^7=128byte
@@ -61,18 +61,32 @@
 #define ESP82_RES_TIMEOUT          (1UL<<31)///< Indicates a previously occured timeout event.
 
 // ESP82 Event strings.
-const char * ESP82_RES_OK_str = "OK";
-const char * ESP82_RES_ERROR_str = "ERROR";
-const char * ESP82_RES_FAIL_str = "FAIL";
-const char * ESP82_RES_BUSYP_str = "busy p...";
-const char * ESP82_RES_BUSYS_str = "busy s...";
-const char * ESP82_RES_WIFI_GOTIP_str = "WIFI GOT IP";
-const char * ESP82_RES_WIFI_CONNECTED_str = "WIFI CONNECTED";
-const char * ESP82_RES_WIFI_DISCONNECT_str = "WIFI DISCONNECT";
-const char * ESP82_RES_SEND_OK_str = "SEND OK";
-const char * ESP82_RES_STATUS_GOTIP_str = "STATUS:2";
-const char * ESP82_RES_CLOSED_str = "CLOSED";
-const char * ESP82_RES_SEND_BEGIN_str = "\r\n> ";
+static const char * ESP82_RES_OK_str = "OK";
+static const char * ESP82_RES_ERROR_str = "ERROR";
+static const char * ESP82_RES_FAIL_str = "FAIL";
+static const char * ESP82_RES_BUSYP_str = "busy p...";
+static const char * ESP82_RES_BUSYS_str = "busy s...";
+static const char * ESP82_RES_WIFI_GOTIP_str = "WIFI GOT IP";
+static const char * ESP82_RES_WIFI_CONNECTED_str = "WIFI CONNECTED";
+static const char * ESP82_RES_WIFI_DISCONNECT_str = "WIFI DISCONNECT";
+static const char * ESP82_RES_SEND_OK_str = "SEND OK";
+static const char * ESP82_RES_STATUS_GOTIP_str = "STATUS:2";
+static const char * ESP82_RES_CLOSED_str = "CLOSED";
+static const char * ESP82_RES_SEND_BEGIN_str = "\r\n> ";
+
+// Variables.
+static unsigned long int (* ESP82_getTime_ms)(void);///< Used to hold handler for time provider.
+static char ESP82_uartTxBuf[ESP82_BUFFERSIZE_UART];///< Buffer for circular uart tx.
+static char ESP82_uartRxBuf[ESP82_BUFFERSIZE_UART];///< Buffer for circular uart rx.
+static char ESP82_resBuffer[ESP82_BUFFERSIZE_RESPONSE]; ///< Buffer to store the response.
+static uint8_t ESP82_resBufferFront;///< Buffer front pointer.
+static uint8_t ESP82_resBufferBack;///< Buffer back pointer.
+static char ESP82_cmdBuffer[ESP82_BUFFERSIZE_CMD];
+static uint32_t ESP82_receivedFlags;///< Used for debug purposes.
+static bool ESP82_inProgress = false;///< State flag for non-blocking functions.
+static void * ESP82_SR_State = NULL;///< State flag for non-blocking functions.
+static const char * ESP82_SSLSIZE_str = "AT+CIPSSLSIZE=4096\r\n";///< ESP8266 module memory (2048 to 4096) reserved for SSL.
+static unsigned long int ESP82_t0;///< Keeps entry time for timeout detection.
 
 // Internal states.
 typedef enum {
@@ -88,19 +102,6 @@ typedef enum {
 	ESP82_State9,
 	ESP82_StateMAX,
 } tESP82_State;
-
-// Variables.
-static uint32_t (* ESP82_getTime_ms)(void);///< Used to hold handler for time provider.
-static char ESP82_uartTxBuf[ESP82_BUFFERSIZE_UART];///< Buffer for circular uart tx.
-static char ESP82_uartRxBuf[ESP82_BUFFERSIZE_UART];///< Buffer for circular uart rx.
-static char ESP82_resBuffer[ESP82_BUFFERSIZE_RESPONSE]; ///< Buffer to store the response.
-static uint8_t ESP82_resBufferFront;///< Buffer front pointer.
-static uint8_t ESP82_resBufferBack;///< Buffer back pointer.
-static char ESP82_cmdBuffer[ESP82_BUFFERSIZE_CMD];
-static uint32_t ESP82_receivedFlags;///< Used for debug purposes.
-static bool ESP82_inProgress = false;///< State flag for non-blocking functions.
-static uint32_t ESP82_t0;///< Keeps entry time for timeout detection.
-const char * ESP82_SSLSIZE_str = "AT+CIPSSLSIZE=4096\r\n";///< ESP8266 module memory (2048 to 4096) reserved for SSL.
 
 /*
  * @brief INTERNAL Timeout setup.
@@ -558,7 +559,10 @@ ESP82_Result_t ESP82_CloseTCP(void) {
  */
 ESP82_Result_t ESP82_Send(const char * const data, const uint8_t dataLength) {
 	// Construct the command on entry.
-	if(!ESP82_inProgress){
+	if(!ESP82_inProgress || (ESP82_SR_State != ESP82_Send)){
+		// Set SR_State as Send.
+		ESP82_SR_State = ESP82_Send;
+
 		// Create the command.
 		sprintf(ESP82_cmdBuffer, "AT+CIPSEND=%i\r\n", dataLength);
 		ESP82_sendCmd(ESP82_cmdBuffer, strlen(ESP82_cmdBuffer), true);
@@ -578,6 +582,12 @@ ESP82_Result_t ESP82_Receive(char * const data, const uint8_t dataLengthMax) {
 	static uint8_t internalState;
 	static unsigned int expectedLength;
 	char * terminatorPosition;
+
+	// Set SR_State as Reveive.
+	if(ESP82_SR_State != ESP82_Receive){
+		ESP82_SR_State = ESP82_Receive;
+		ESP82_inProgress = false;
+	}
 
 	// Receive the available data.
 	ESP82_resBufferBack += CircularUART_Receive(&ESP82_resBuffer[ESP82_resBufferBack], ESP82_BUFFERSIZE_RESPONSE - 1 - ESP82_resBufferBack);
